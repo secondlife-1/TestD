@@ -1,160 +1,112 @@
-name: MRH Universal Downloader
+name: '📦 حرفه‌ای: دانلود و ذخیره در مخزن'
 
 on:
-  push:
-    branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      file_urls:
+        description: '🔗 لینک مستقیم فایل‌ها (با کاما جدا کنید) مثال: url1,url2,url3'
+        required: true
+        type: string
+        default: 'LINK1,LINK2,LINK3'
+      password:
+        description: '🔐 رمز فایل فشرده (اختیاری)'
+        required: false
+        type: string
+        default: ''
+      split_size:
+        description: '📦 حجم هر تکه (پیش‌فرض: 95m)'
+        required: false
+        type: string
+        default: '95m'
 
 permissions:
   contents: write
 
 jobs:
-  download:
+  download-and-commit:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        
-    - name: Install yt-dlp (for Instagram)
-      run: |
-        pip install yt-dlp
-        
-    - name: Create folders
-      run: |
-        mkdir -p downloads/instagram
-        mkdir -p downloads/github
-        mkdir -p downloads/direct
-        
-    - name: Get commit message
-      id: msg
-      run: |
-        MSG=$(git log -1 --pretty=%B)
-        echo "full=$MSG" >> $GITHUB_OUTPUT
-        echo "📝 Commit: $MSG"
-        
-    # ============================================
-    # 1. INSTAGRAM
-    # ============================================
-    - name: Download from Instagram
-      if: contains(steps.msg.outputs.full, 'dl-ig:')
-      run: |
-        URL=$(echo "${{ steps.msg.outputs.full }}" | grep -o 'dl-ig: [^ ]*' | cut -d' ' -f2)
-        echo "📸 Instagram: $URL"
-        cd downloads/instagram
-        yt-dlp --no-playlist "$URL" --retries 5
-        cd ../..
-        echo "✅ Instagram done"
-        
-    # ============================================
-    # 2. GITHUB RELEASE
-    # ============================================
-    - name: Download from GitHub
-      if: contains(steps.msg.outputs.full, 'dl-gh:')
-      run: |
-        URL=$(echo "${{ steps.msg.outputs.full }}" | grep -o 'dl-gh: [^ ]*' | cut -d' ' -f2)
-        echo "🐙 GitHub: $URL"
-        mkdir -p downloads/github
-        cd downloads/github
-        curl -L -O --retry 5 --retry-delay 2 --max-time 600 --keepalive-time 60 --continue-at - "$URL"
-        cd ../..
-        echo "✅ GitHub done"
-        
-    # ============================================
-    # 3. DIRECT LINK (با تشخیص خودکار حجم و فشرده‌سازی برای فایل‌های بالای 95 مگ)
-    # ============================================
-    - name: Download direct link
-      if: contains(steps.msg.outputs.full, 'dl:') && !contains(steps.msg.outputs.full, 'dl-ig:') && !contains(steps.msg.outputs.full, 'dl-gh:')
-      run: |
-        URL=$(echo "${{ steps.msg.outputs.full }}" | grep -o 'dl: [^ ]*' | cut -d' ' -f2)
-        echo "📁 Direct: $URL"
-        
-        FILENAME=$(basename "$URL" | cut -d '?' -f1)
-        [ -z "$FILENAME" ] && FILENAME="file_$(date +%H%M%S)"
-        
-        mkdir -p downloads/direct
-        
-        echo "⬇️ Downloading $FILENAME ..."
-        curl -L -o "downloads/direct/$FILENAME" --retry 5 --retry-delay 2 --max-time 600 --keepalive-time 60 "$URL"
-        
-        if [ ! -f "downloads/direct/$FILENAME" ]; then
-          echo "❌ Download failed"
-          exit 1
-        fi
-        
-        # گرفتن حجم فایل بر حسب مگابایت
-        if command -v stat &> /dev/null; then
-          FILE_SIZE_BYTES=$(stat -c%s "downloads/direct/$FILENAME" 2>/dev/null || stat -f%z "downloads/direct/$FILENAME" 2>/dev/null)
-          FILE_SIZE_MB=$((FILE_SIZE_BYTES / 1024 / 1024))
-          echo "📊 File size: ${FILE_SIZE_MB} MB"
+      - name: 🔄 دریافت کد مخزن
+        uses: actions/checkout@v4
+
+      - name: ⚙️ نصب ابزارها
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full file
+      - name: 📥 پردازش و دانلود همه فایل‌ها
+        id: process
+        run: |
+          # تبدیل ورودی: جدا کردن با کاما و حذف فاصله‌های اضافی
+          echo "${{ github.event.inputs.file_urls }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d' > /tmp/urls.txt
           
-          # اگر حجم فایل بیشتر از 95 مگابایت بود، آن را تکه تکه و زیپ کن
-          if [ $FILE_SIZE_MB -ge 95 ]; then
-            echo "⚙️ File is ≥95 MB. Splitting and compressing..."
+          while IFS= read -r URL || [ -n "$URL" ]; do
+            [ -z "$URL" ] && continue
             
-            cd downloads/direct
+            echo "========================================="
+            echo "🔽 شروع دانلود: $URL"
             
-            # تکه تکه کردن فایل به قطعات 95 مگابایتی
-            split -b $((95 * 1024 * 1024)) "$FILENAME" "${FILENAME}.part."
+            # استخراج نام فایل از لینک
+            FILENAME=$(basename "$URL" | sed 's/\?.*//' | sed 's/%20/ /g')
+            if [ -z "$FILENAME" ]; then
+              FILENAME="downloaded_file_$(date +%s)"
+            fi
             
-            # زیپ کردن قطعات
-            zip "${FILENAME}.zip" "${FILENAME}.part."* > /dev/null 2>&1
+            SAFE_FILENAME=$(echo "$FILENAME" | sed 's/[\\/:*?"<>|]/_/g')
+            echo "نام فایل: $SAFE_FILENAME"
             
-            # حذف فایل اصلی و قطعات
-            rm -f "$FILENAME"
-            rm -f "${FILENAME}.part."*
+            curl -L --fail --retry 3 --retry-delay 2 --progress-bar -o "$SAFE_FILENAME" "$URL"
+            if [ $? -ne 0 ]; then
+              echo "❌ خطا در دانلود: $URL → ادامه به لینک بعدی"
+              continue
+            fi
             
-            cd ../..
-            echo "✅ File compressed to ${FILENAME}.zip"
-          else
-            echo "✅ File size <95 MB, saved directly"
-          fi
-        else
-          echo "⚠️ Could not determine file size, saved as is"
-        fi
-        
-        echo "✅ Direct download processed"
-        
-    # ============================================
-    # 4. STOP COMMAND
-    # ============================================
-    - name: Stop command
-      if: contains(steps.msg.outputs.full, 'dl-stop')
-      run: |
-        echo "🛑 Emergency stop activated"
-        exit 0
-        
-    # ============================================
-    # 5. SHOW RESULTS
-    # ============================================
-    - name: Show results
-      run: |
-        echo ""
-        echo "=========================================="
-        echo "📁 DOWNLOADED FILES:"
-        echo "=========================================="
-        if [ -d downloads ] && [ "$(ls -A downloads 2>/dev/null)" ]; then
-          find downloads -type f -exec ls -lh {} \;
-          echo ""
-          echo "📊 Total size: $(du -sh downloads | cut -f1)"
-        else
-          echo "⚠️ No files found in downloads folder"
-        fi
-        echo "=========================================="
-        
-    # ============================================
-    # 6. COMMIT FILES
-    # ============================================
-    - name: Commit files
-      run: |
-        git config user.name "MRH Bot"
-        git config user.email "bot@localhost"
-        git add downloads/ || true
-        git diff --staged --quiet || git commit -m "MRH: Downloads [skip ci]"
-        git push || true
+            echo "✅ دریافت شد: $SAFE_FILENAME"
+            
+            # تشخیص دسته و ساخت پوشه
+            RAW_NAME="$SAFE_FILENAME"
+            BASENAME_NOEXT="${RAW_NAME%.*}"
+            [ "$BASENAME_NOEXT" = "$RAW_NAME" ] && BASENAME_NOEXT="$RAW_NAME"
+            FOLDER_NAME=$(echo "$BASENAME_NOEXT" | sed 's/[\\/:*?"<>|]/_/g')
+            [ -z "$FOLDER_NAME" ] && FOLDER_NAME="downloaded_file"
+            
+            MIME=$(file -b --mime-type "$SAFE_FILENAME")
+            EXT="${RAW_NAME##*.}"
+            EXT=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+            
+            if [[ "$MIME" == video/* ]] || [[ "$EXT" =~ ^(mp4|mkv|avi|mov|wmv|flv|webm)$ ]]; then
+              CAT="video"
+            elif [[ "$MIME" == audio/* ]] || [[ "$EXT" =~ ^(mp3|wav|ogg|flac|m4a)$ ]]; then
+              CAT="audio"
+            elif [[ "$MIME" == image/* ]] || [[ "$EXT" =~ ^(jpg|jpeg|png|gif|bmp|webp)$ ]]; then
+              CAT="image"
+            elif [[ "$MIME" == application/pdf ]] || [[ "$EXT" =~ ^(pdf|doc|docx|xls|xlsx|ppt|pptx|txt)$ ]]; then
+              CAT="document"
+            else
+              CAT="other"
+            fi
+            
+            FINAL_DIR="downloads/$CAT/$FOLDER_NAME"
+            mkdir -p "$FINAL_DIR"
+            
+            rm -f "$FINAL_DIR"/*.7z*
+            
+            if [ -z "${{ github.event.inputs.password }}" ]; then
+              7z a -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "$FINAL_DIR/archive.7z" "./$SAFE_FILENAME"
+            else
+              7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "$FINAL_DIR/archive.7z" "./$SAFE_FILENAME"
+            fi
+            
+            echo "✅ ذخیره شد: $FOLDER_NAME ← $SAFE_FILENAME"
+            
+            rm -f "$SAFE_FILENAME"
+            
+          done < /tmp/urls.txt
+          
+          echo "🎉 همه لینک‌ها پردازش شدند."
+      - name: 📝 کامیت و پوش به مخزن
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add downloads/
+          git commit -m "Add multiple files [$(date +'%Y-%m-%d %H:%M')]" || echo "Nothing to commit"
+          git push
